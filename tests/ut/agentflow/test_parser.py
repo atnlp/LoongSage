@@ -1145,6 +1145,74 @@ def test_build_turn_input_compaction_opens_new_mainline_segment() -> None:
     assert ctx.is_subagent_placeholder is False
 
 
+_R3_PARENT_ROWS = torch.arange(14, dtype=torch.uint8).reshape(7, 2)
+
+
+def _run_compact_r3_turn(**parser_kwargs):
+    """Open a compact segment whose prompt shares 3 tokens with its compact parent, then
+    feed a fake SGLang response covering ``[start_len, seqlen - 1)`` plus the terminal row.
+
+    Returns ``(turn_ctx, trajectory)`` after update_trajectory.
+    """
+    new_prompt = [11, 12, 13, 90, 91]  # shares [11, 12, 13] with the parent segment
+
+    async def apply_chat_template(messages, **kwargs):
+        return list(new_prompt)
+
+    parser = TrajectoryParser(
+        trajectory_store=TrajectoryStore(),
+        tokenizer_manager=SimpleNamespace(system_prompt_len=0, apply_chat_template=apply_chat_template),
+        r3_enabled=True,
+        **parser_kwargs,
+    )
+    trajectory = Trajectory(
+        trajectory_id="traj-r3-compact",
+        prompt_id="p",
+        status=TrajectoryStatus.GENERATING,
+        tokens=[1, 2, 11, 12, 13, 14, 15],
+        active_segment_id=1,
+        chat_completions={
+            0: [{"role": "user", "content": "root"}],
+            1: [{"role": "user", "content": "summary 1"}],
+        },
+        segments=[
+            Segment(token_start=0, token_end=2, segment_id=0, origin="root"),
+            Segment(token_start=2, token_end=7, segment_id=1, parent_segment_id=0, origin="compact"),
+        ],
+        rollout_routed_experts=_R3_PARENT_ROWS.clone(),
+    )
+    parser.trajectory_store.add(trajectory.trajectory_id, trajectory)
+
+    ctx = asyncio.run(parser.build_turn_input(
+        trajectory, messages=[{"role": "user", "content": "summary 2"}], request_kind=None,
+    ))
+    assert ctx.start_new_segment is True and ctx.new_segment_origin == "compact"
+
+    response_ids = [201, 202]
+    seqlen = len(new_prompt) + len(response_ids)
+    captured = seqlen - 1 - ctx.routed_experts_start_len
+    chunk = torch.full((captured, 2), 99, dtype=torch.uint8)
+    chunk = torch.cat([chunk, chunk[-1:]], dim=0)  # synthetic terminal row, as _decode_response_r3
+    payload, assistant_message, _ = parser.build_assistant_message(
+        {"text": "ok", "meta_info": {"weight_version": "1",
+                                     "output_token_logprobs": [[-0.1, 201], [-0.2, 202]]}},
+        routed_experts=chunk,
+    )
+    parser.update_trajectory(trajectory, ctx, payload, assistant_message)
+    return ctx, trajectory
+
+
+def test_compact_segment_requests_full_r3_and_aligns_rows() -> None:
+    """A compact segment asks SGLang for its full routing; rows stay aligned with tokens."""
+    ctx, trajectory = _run_compact_r3_turn()
+
+    assert ctx.routed_experts_start_len == 0
+    experts = trajectory.rollout_routed_experts
+    assert experts.size(0) == len(trajectory.tokens) == 14
+    assert torch.equal(experts[:7], _R3_PARENT_ROWS)
+    assert (experts[7:] == 99).all()
+
+
 def test_build_turn_input_matches_reserialized_tool_call_arguments() -> None:
     """A follow-up turn must continue the active segment even when the client
     re-serializes tool_call arguments (JSON.stringify drops the spaces the SGLang
